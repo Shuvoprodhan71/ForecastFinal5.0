@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>METR-LA Traffic Speed Forecasting</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"/>
+  <style>
+    body { background:#0f172a; color:#e2e8f0; font-family:'Segoe UI',sans-serif; }
+    #map { height:480px; border-radius:12px; border:1px solid #334155; }
+    .card { background:#1e293b; border:1px solid #334155; border-radius:12px; }
+    .card-header { background:#0f172a; border-bottom:1px solid #334155; font-weight:600; }
+    .badge-free   { background:#22c55e; }
+    .badge-mod    { background:#f59e0b; }
+    .badge-cong   { background:#ef4444; }
+    .btn-predict  { background:#6366f1; border:none; }
+    .btn-predict:hover { background:#4f46e5; }
+    .stat-box { text-align:center; padding:12px; border-radius:8px; }
+    .stat-free { background:#14532d; }
+    .stat-mod  { background:#78350f; }
+    .stat-cong { background:#7f1d1d; }
+    .result-box { background:#0f172a; border-radius:8px; padding:16px; margin-top:12px; }
+    .speed-val  { font-size:2.5rem; font-weight:700; color:#6366f1; }
+    canvas { max-height:220px; }
+    #uploadResult { font-size:0.85rem; }
+  </style>
+</head>
+<body>
+<div class="container-fluid py-3">
+
+  <!-- Header -->
+  <div class="text-center mb-3">
+    <h3 class="fw-bold" style="color:#6366f1;">METR-LA Traffic Speed Forecasting</h3>
+    <p class="text-secondary mb-0">207 sensors · Los Angeles freeway network · 5-minute ahead prediction</p>
+  </div>
+
+  <!-- Stats row -->
+  <div class="row g-2 mb-3" id="statsRow">
+    <div class="col-4"><div class="stat-box stat-free"><div class="fw-bold fs-4" id="statFree">—</div><small>Free Flow</small></div></div>
+    <div class="col-4"><div class="stat-box stat-mod"><div class="fw-bold fs-4" id="statMod">—</div><small>Moderate</small></div></div>
+    <div class="col-4"><div class="stat-box stat-cong"><div class="fw-bold fs-4" id="statCong">—</div><small>Congested</small></div></div>
+  </div>
+
+  <div class="row g-3">
+    <!-- Map -->
+    <div class="col-lg-7">
+      <div class="card">
+        <div class="card-header">📍 Sensor Map — click a marker to select</div>
+        <div class="card-body p-2"><div id="map"></div></div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="col-lg-5">
+      <div class="card mb-3">
+        <div class="card-header">🔮 Predict Speed</div>
+        <div class="card-body">
+          <div class="mb-2">
+            <label class="form-label small">Sensor ID</label>
+            <input id="sensorInput" class="form-control form-control-sm bg-dark text-light border-secondary"
+                   placeholder="Click map or type sensor ID"/>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small">Model</label>
+            <select id="modelSelect" class="form-select form-select-sm bg-dark text-light border-secondary">
+              <option value="lstm">LSTM (Deep Learning )</option>
+              <option value="rf">Random Forest</option>
+            </select>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small">Last 12 speed readings (mph) — comma separated</label>
+            <input id="speedsInput" class="form-control form-control-sm bg-dark text-light border-secondary"
+                   value="55,57,56,54,53,55,58,60,59,57,56,55"/>
+          </div>
+          <button class="btn btn-predict btn-sm text-white w-100" onclick="predict()">Predict →</button>
+
+          <div class="result-box d-none" id="resultBox">
+            <div class="text-center">
+              <div class="speed-val" id="resultSpeed">—</div>
+              <div class="text-secondary small">mph (5 min ahead)</div>
+              <span class="badge mt-1" id="resultBadge">—</span>
+            </div>
+            <div class="mt-2 small text-secondary" id="resultMeta"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Chart -->
+      <div class="card mb-3">
+        <div class="card-header">📈 Speed History + Prediction</div>
+        <div class="card-body"><canvas id="speedChart"></canvas></div>
+      </div>
+
+      <!-- CSV Upload -->
+      <div class="card">
+        <div class="card-header">📂 Batch CSV Upload</div>
+        <div class="card-body">
+          <input type="file" id="csvFile" accept=".csv" class="form-control form-control-sm bg-dark text-light border-secondary mb-2"/>
+          <button class="btn btn-sm btn-outline-info w-100 mb-2" onclick="uploadCSV()">Upload & Predict</button>
+          <a href="/static/sample_upload.csv" class="btn btn-sm btn-outline-secondary w-100 mb-2">Download Sample CSV</a>
+          <div id="uploadResult" class="text-secondary"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+// ── Map ───────────────────────────────────────────────────────
+const map = L.map('map' ).setView([34.05, -118.25], 10);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  {attribution:'© OpenStreetMap © CARTO', maxZoom:19} ).addTo(map);
+
+const markers = {};
+let selectedSensor = null;
+let chartObj = null;
+
+function condColor(cond){
+  if(cond==='Free Flow') return '#22c55e';
+  if(cond==='Moderate')  return '#f59e0b';
+  return '#ef4444';
+}
+
+fetch('/api/sensors').then(r=>r.json()).then(data=>{
+  Object.entries(data).forEach(([sid, info])=>{
+    const m = L.circleMarker([info.lat, info.lng],
+      {radius:5, color:'#6366f1', fillColor:'#818cf8', fillOpacity:0.8, weight:1})
+      .addTo(map)
+      .bindPopup(`<b>Sensor ${sid}</b>  
+Lat: ${info.lat}  
+Lng: ${info.lng}`);
+    m.on('click', ()=>{ selectSensor(sid); });
+    markers[sid] = m;
+  });
+  console.log(`Loaded ${Object.keys(data).length} sensors`);
+});
+
+function selectSensor(sid){
+  selectedSensor = sid;
+  document.getElementById('sensorInput').value = sid;
+  if(markers[sid]) markers[sid].openPopup();
+}
+
+// ── Stats ─────────────────────────────────────────────────────
+function loadStats(){
+  fetch('/api/stats').then(r=>r.json()).then(d=>{
+    document.getElementById('statFree').textContent = d.free_flow;
+    document.getElementById('statMod').textContent  = d.moderate;
+    document.getElementById('statCong').textContent = d.congested;
+  }).catch(()=>{});
+}
+loadStats();
+
+// ── Predict ───────────────────────────────────────────────────
+function predict(){
+  const sid   = document.getElementById('sensorInput').value.trim();
+  const model = document.getElementById('modelSelect').value;
+  const raw   = document.getElementById('speedsInput').value;
+  const speeds = raw.split(',').map(v=>parseFloat(v.trim())).filter(v=>!isNaN(v));
+
+  if(!sid){ alert('Please select or enter a sensor ID.'); return; }
+  if(speeds.length !== 12){ alert('Please enter exactly 12 comma-separated speed values.'); return; }
+
+  fetch('/api/predict', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({sensor_id: sid, model: model, speeds: speeds})
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){ alert('Error: '+d.error); return; }
+    document.getElementById('resultSpeed').textContent = d.speed_mph.toFixed(1);
+    const badge = document.getElementById('resultBadge');
+    badge.textContent = d.condition;
+    badge.style.background = condColor(d.condition);
+    document.getElementById('resultMeta').textContent =
+      `Model: ${d.model} | Sensor: ${d.sensor_id}`;
+    document.getElementById('resultBox').classList.remove('d-none');
+
+    // Update marker color
+    if(markers[sid]){
+      markers[sid].setStyle({color: condColor(d.condition), fillColor: condColor(d.condition)});
+    }
+
+    // Chart
+    const labels = speeds.map((_,i)=>`t-${12-i}`).concat(['t+1 (pred)']);
+    const values = speeds.concat([d.speed_mph]);
+    const colors = speeds.map(()=>'rgba(99,102,241,0.7)').concat([condColor(d.condition)]);
+
+    if(chartObj) chartObj.destroy();
+    chartObj = new Chart(document.getElementById('speedChart'), {
+      type:'bar',
+      data:{
+        labels: labels,
+        datasets:[{
+          label:'Speed (mph)',
+          data: values,
+          backgroundColor: colors,
+          borderRadius: 4
+        }]
+      },
+      options:{
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{ticks:{color:'#94a3b8'}, grid:{color:'#1e293b'}},
+          y:{ticks:{color:'#94a3b8'}, grid:{color:'#334155'},
+             suggestedMin:0, suggestedMax:80}
+        }
+      }
+    });
+  })
+  .catch(e=>alert('Request failed: '+e));
+}
+
+// ── CSV Upload ────────────────────────────────────────────────
+function uploadCSV(){
+  const fileInput = document.getElementById('csvFile');
+  if(!fileInput.files.length){ alert('Please select a CSV file.'); return; }
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  document.getElementById('uploadResult').textContent = 'Processing…';
+  fetch('/api/upload/csv', {method:'POST', body: fd})
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){ document.getElementById('uploadResult').textContent='Error: '+d.error; return; }
+    let html = `<b>${d.total} predictions</b>  
+`;
+    d.predictions.forEach(p=>{
+      html += `Sensor ${p.sensor_id} [${p.model}]: <b>${p.speed_mph} mph</b> — ${p.condition}  
+`;
+    });
+    if(d.errors.length) html += `<span class="text-danger">Errors: ${d.errors.join('; ')}</span>`;
+    document.getElementById('uploadResult').innerHTML = html;
+  })
+  .catch(e=>{ document.getElementById('uploadResult').textContent='Failed: '+e; });
+}
+</script>
+</body>
+</html>
